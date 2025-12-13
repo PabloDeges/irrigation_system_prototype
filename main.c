@@ -180,7 +180,7 @@ int main(void)
 
 
 
-        if (adc_value > MOISTURE_THOLD)
+        if (adc_value < MOISTURE_THOLD)
         {
             // LED on
             PORTB |= (1 << 5);
