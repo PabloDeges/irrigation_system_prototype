@@ -1,4 +1,4 @@
-#define F_CPU 16000000UL // 16mhz clock speed of arduino board
+#define F_CPU 16000000UL // 16mhz crystal clock speed of arduino board
 
 #include <avr/io.h>
 #include <util/delay.h>
@@ -8,23 +8,43 @@
 #include <avr/interrupt.h>
 
 // simple soil moisture monitor on atmega328p microcontroller 
-// LED ON -> soil moisture levels okay
-// LED OFF -> soil moisture too dry -> activate pump later
 
-#define MOISTURE_THOLD 800
-#define TEMPERATURE_THOLD 27
-#define HUMID_THOLD 35
-#define TIMEDEC_TEMP 1800
-#define TIMEADD_HUMID 600
+#define TIME_BTWN_WATER_BURST 10 // wait 10 seconds to give the water time to dissolve into the soil, prevents overwatering
+#define RAW_TTN_CHECK_SEC 43200UL // 12hours - how long to sleep before next sensor poll, without weights for temp & humidity
+#define TIME_WEIGHT_TEMP_SEC 21600UL // +/- 6h 
+#define TIME_WEIGHT_HUMID_SEC 7200UL // +/- 2h
+#define TIME_WEIGHT_OVERWATERED 18000UL 
 
-#define DHT_PIN 2    // PD2 / Arduino digital pin 2
+#define TEMP_LOW 16 // if lower, lower rate of evaporation
+#define TEMP_HIGH 25 // if higher, higher rate of evaporation
+
+#define HUMID_LOW 35 // if lower, highter rate of evaporation
+#define HUMID_HIGH 60 // if higher, low rate of evaporation
+
+// NOT CALIBRATED YET
+#define SOIL_DRY_RED 800 // dry soil, water!
+#define SOIL_OKAY_YELLOW 650 // desired level, between recently watered and too dry
+#define SOIL_WET_GREEN 450 // recently watered, very wet soil
+#define SOIL_SOAKED_BLUE 380 // way too much water
+
+// SETUP DHT11 Temperature and Humidity Sensor
+#define DHT_PIN 2    // PD2
 #define DHT_PORT PORTD
 #define DHT_PINR PIND
 #define DHT_DDR DDRD
 
-volatile uint8_t wdt_flag = 0;
+// SETUP LEDs
+#define LED_DDR DDRD
+#define LED_PORT PORTD
+#define LED_RED 128
+#define LED_YELLOW 64
+#define LED_GREEN 32
+#define LED_BLUE 16
 
-ISR(WDT_vect) {
+
+volatile uint8_t wdt_flag = 0; // watchdog timer flag for deep sleep
+
+ISR(WDT_vect) { // interrupt service routine, what to do on interrupt by WDT
     wdt_flag = 1;  // Set flag to wake up
 }
 
@@ -46,12 +66,16 @@ void sleep_wdt() { // sleep using watchdog timer
     wdt_flag = 0; // Clear wakeup flag
 }
 
-void sleep_seconds(uint8_t seconds) {
-    uint16_t cycles = seconds / 8; // 8 s per WDT cycle
-    for(uint16_t i = 0; i < cycles; i++) {
+void sleep_seconds(unsigned long seconds)
+{
+    unsigned long cycles = seconds / 8UL; // 8 s per WDT cycle
+
+    for (unsigned long i = 0; i < cycles; i++)
+    {
         sleep_wdt();
     }
 }
+
 
 
 void adc_init(void)
@@ -141,61 +165,72 @@ uint8_t DHT_read_sensor()
 
 int main(void)
 {
-    uint16_t adc_value;
-
+    
     uint8_t humidity;
     uint8_t temperature;
 
-    long time_before_next_read_s = 3600; // *1000 for ms, dont forget 
-
+    uint16_t adc_value;
     // set PB5 as output (onboard Led) -> basic monitoring of soil status, replace or add pump later
     DDRB |= (1 << 5); // shift by 5 to reference pb5 because 5th bit in DDRB
-
     adc_init();
 
-    
+    DDRD |= 0b11110000; // enable digital pins 4-7 as output (LEDs)
+
 
     while (1)
     {
-        adc_value = adc_read(0);   // read A0
+        adc_value = adc_read(0);   // VAL BETWEEN 300(SUBMERGED) AND 1023(DRY) - read A0 - soil humidity sensor 
 
         if (!DHT_read_sensor()) {
             humidity = DHT_data[0];
             temperature = DHT_data[2];
         }
-        int temperature_time_dec;
-        int humidity_time_add;
+        // MODIFY DEEP SLEEP TIME OF NEXT CYCLE USING AMBIENT TEMP & HUMIDITY 
+        long time_before_next_measurement = RAW_TTN_CHECK_SEC;
 
-        if(temperature >= TEMPERATURE_THOLD) { // higher rate of evaporation -> higher probability of soil being dry
-            temperature_time_dec = TIMEDEC_TEMP;
-        } else {
-            temperature_time_dec = 0;
+        if(humidity < HUMID_LOW) { // TODO: später mit function und pointerübergabe ersetzen
+            time_before_next_measurement -= TIME_WEIGHT_HUMID_SEC;
+        }
+        else if (humidity > HUMID_HIGH){ 
+            time_before_next_measurement += TIME_WEIGHT_HUMID_SEC;
         }
 
-        if(humidity >= HUMID_THOLD) { // higher moisture in the air that the plant can use, -> lower prob of dry, less impact than hot air tho
-            humidity_time_add = TIMEADD_HUMID;
-        } else {
-            humidity_time_add = 0;
+        if(temperature < TEMP_LOW) { // TODO: später mit function und pointerübergabe ersetzen
+            time_before_next_measurement += TIME_WEIGHT_TEMP_SEC;
+        }
+        else if (temperature > TEMP_HIGH){ 
+            time_before_next_measurement -= TIME_WEIGHT_TEMP_SEC;
         }
 
+        // WATERING DECISION
 
+        PORTD &= 240; // 0b11110000 - set all LEDs to LOW
 
-        if (adc_value < MOISTURE_THOLD)
-        {
-            // LED on
-            PORTB |= (1 << 5);
-        }
-        else
-        {
-            // LED off
-            PORTB &= ~(1 << 5); // tilde operator -> invert / NOT, &= -> only affect bit 5
-        }
-
-
-        long time_to_sleep = time_before_next_read_s + TIMEADD_HUMID - TIMEDEC_TEMP; // in ms
         
-        
-        sleep_seconds(time_to_sleep);
+        if(adc_value > SOIL_DRY_RED) {
+            PORTD &= 240; // 0b11110000 - set all LEDs to LOW
+            PORTD |= LED_RED;
+            while (adc_value > SOIL_WET_GREEN) {
+                // NO PUMP AVAILABLE YET, BUT SEND HIGH SIGNAL FOR 1-2 SEC HERE
+                // ============== ACTIVATE WATER PUMP THROUGH HIGH SIGNAL ON DIGI PIN CONTROLLING TRANSISTOR PROBABLY ==============
+                sleep_seconds(TIME_BTWN_WATER_BURST);
+                adc_value = adc_read(0); 
+            }
+        }
+        else if(adc_value > SOIL_OKAY_YELLOW) {
+            PORTD &= 240; // 0b11110000 - set all LEDs to LOW
+            PORTD |= LED_YELLOW;
+        }
+        else if(adc_value > SOIL_WET_GREEN) {
+            PORTD &= 240; // 0b11110000 - set all LEDs to LOW
+            PORTD |= LED_GREEN;
+        }else if(adc_value < SOIL_SOAKED_BLUE) {
+            PORTD &= 240; // 0b11110000 - set all LEDs to LOW
+            PORTD |= LED_BLUE;
+            sleep_seconds(TIME_WEIGHT_OVERWATERED); // even longer sleep before next check, because soil has more water than normal, no need to check earlier
+        }
+             
+        sleep_seconds(time_before_next_measurement); // go into sleep to save power, before next measuring
         
     }
 }
